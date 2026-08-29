@@ -9,7 +9,6 @@ from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI(title="Digit Matrix API")
 
-# Allow your Vercel frontend to talk to this backend
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -93,6 +92,22 @@ async def startup():
 @app.get("/")
 async def root():
     return {"status": "Digit Matrix API is running"}
+
+# NEW: Frontend pushes ticks here (more reliable than backend WS on free tier)
+@app.post("/api/ticks")
+async def receive_tick(tick: dict):
+    try:
+        conn = await asyncpg.connect(DATABASE_URL)
+        price = float(tick.get("quote", 0))
+        digit = int(str(price).replace('.', '')[-1]) if price else 0
+        await conn.execute(
+            "INSERT INTO ticks (market, price, digit) VALUES ($1, $2, $3)",
+            tick.get("symbol"), price, digit
+        )
+        await conn.close()
+        return {"status": "received"}
+    except Exception as e:
+        return {"error": str(e)}
 
 @app.get("/api/analysis/{market}")
 async def get_analysis(market: str, lookback: int = 100):
