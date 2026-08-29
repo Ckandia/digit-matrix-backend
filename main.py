@@ -1,9 +1,7 @@
 import os
-import json
 import asyncio
 import asyncpg
-import websockets
-from datetime import datetime
+from datetime import datetime, timedelta
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -22,7 +20,6 @@ app.add_middleware(
 )
 
 DATABASE_URL = os.getenv("DATABASE_URL")
-DERIV_APP_ID = os.getenv("DERIV_APP_ID", "1089")
 
 async def init_db():
     conn = await asyncpg.connect(DATABASE_URL)
@@ -53,64 +50,48 @@ async def init_db():
     """)
     await conn.close()
 
-async def deriv_ws_listener():
-    uri = f"wss://ws.derivws.com/websockets/v3?app_id={DERIV_APP_ID}"
-    markets = ["R_10", "R_25", "R_50", "R_75", "R_100"]
-    
+async def cleanup_old_ticks():
+    """Keep only the last 7 days of ticks so the free database never fills up."""
     while True:
+        await asyncio.sleep(3600)  # run every hour
         try:
-            async with websockets.connect(uri) as ws:
-                for m in markets:
-                    await ws.send(json.dumps({
-                        "ticks": m,
-                        "subscribe": 1
-                    }))
-                
-                async for message in ws:
-                    data = json.loads(message)
-                    if data.get("tick"):
-                        tick = data["tick"]
-                        price = float(tick["quote"])
-                        digit = int(str(price).replace('.', '')[-1])
-                        market = tick["symbol"]
-                        
-                        conn = await asyncpg.connect(DATABASE_URL)
-                        await conn.execute(
-                            "INSERT INTO ticks (market, price, digit) VALUES ($1, $2, $3)",
-                            market, price, digit
-                        )
-                        await conn.close()
-        except Exception as e:
-            print(f"[WS Error] {e} — reconnecting in 5s...")
-            await asyncio.sleep(5)
+            conn = await asyncpg.connect(DATABASE_URL)
+            await conn.execute(
+                "DELETE FROM ticks WHERE tick_time < NOW() - INTERVAL '7 days'"
+            )
+            await conn.close()
+        except Exception:
+            pass
 
 @app.on_event("startup")
 async def startup():
     await init_db()
-    asyncio.create_task(deriv_ws_listener())
+    asyncio.create_task(cleanup_old_ticks())
 
 @app.get("/")
 async def root():
     return {"status": "Digit Matrix API is running"}
 
-# NEW: Frontend pushes ticks here (more reliable than backend WS on free tier)
+# FRONTEND pushes ticks here
 @app.post("/api/ticks")
 async def receive_tick(tick: dict):
     try:
         conn = await asyncpg.connect(DATABASE_URL)
         price = float(tick.get("quote", 0))
         digit = int(str(price).replace('.', '')[-1]) if price else 0
+        symbol = tick.get("symbol", "unknown")
         await conn.execute(
             "INSERT INTO ticks (market, price, digit) VALUES ($1, $2, $3)",
-            tick.get("symbol"), price, digit
+            symbol, price, digit
         )
         await conn.close()
         return {"status": "received"}
     except Exception as e:
         return {"error": str(e)}
 
+# Analyze LAST 1000 TICKS (professional standard)
 @app.get("/api/analysis/{market}")
-async def get_analysis(market: str, lookback: int = 100):
+async def get_analysis(market: str, lookback: int = 1000):
     conn = await asyncpg.connect(DATABASE_URL)
     rows = await conn.fetch(
         "SELECT digit FROM ticks WHERE market = $1 ORDER BY tick_time DESC LIMIT $2",
@@ -122,21 +103,45 @@ async def get_analysis(market: str, lookback: int = 100):
     if not digits:
         return {"error": "No tick data yet. Collecting..."}
     
-    freq = {str(i): round(digits.count(i) / len(digits) * 100, 1) for i in range(10)}
+    total = len(digits)
+    freq = {str(i): round(digits.count(i) / total * 100, 1) for i in range(10)}
     even = sum(1 for d in digits if d % 2 == 0)
+    
+    # Find hottest and coldest digits
+    hot_digit = max(freq, key=freq.get)
+    cold_digit = min(freq, key=freq.get)
+    
+    # Streak detection (how many times same digit repeated consecutively)
+    max_streak = 1
+    current_streak = 1
+    streak_digit = digits[0] if digits else 0
+    for i in range(1, len(digits)):
+        if digits[i] == digits[i-1]:
+            current_streak += 1
+            if current_streak > max_streak:
+                max_streak = current_streak
+                streak_digit = digits[i]
+        else:
+            current_streak = 1
+    
+    # Last 20 digits for display
+    last_20 = digits[:20]
     
     return {
         "market": market,
-        "lookback": len(digits),
+        "lookback": total,
         "frequency_percent": freq,
         "even_odd": {
             "even": even, 
-            "odd": len(digits) - even, 
-            "even_pct": round(even/len(digits)*100, 1)
+            "odd": total - even, 
+            "even_pct": round(even/total*100, 1)
         },
-        "hot_digit": max(freq, key=freq.get),
-        "cold_digit": min(freq, key=freq.get),
-        "last_10_digits": digits[:10],
+        "hot_digit": hot_digit,
+        "cold_digit": cold_digit,
+        "hot_pct": freq[hot_digit],
+        "cold_pct": freq[cold_digit],
+        "max_streak": {"digit": streak_digit, "length": max_streak},
+        "last_20_digits": last_20,
     }
 
 @app.post("/api/trades")
