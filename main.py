@@ -1,7 +1,7 @@
 import os
 import asyncio
 import asyncpg
-from datetime import datetime, timedelta
+from datetime import datetime
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -9,11 +9,7 @@ app = FastAPI(title="Digit Matrix API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://digit-matrix-carlos-githaes-projects.vercel.app",
-        "http://localhost:4003",
-        "http://localhost:3000",
-    ],
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -51,14 +47,11 @@ async def init_db():
     await conn.close()
 
 async def cleanup_old_ticks():
-    """Keep only the last 7 days of ticks so the free database never fills up."""
     while True:
-        await asyncio.sleep(3600)  # run every hour
+        await asyncio.sleep(3600)
         try:
             conn = await asyncpg.connect(DATABASE_URL)
-            await conn.execute(
-                "DELETE FROM ticks WHERE tick_time < NOW() - INTERVAL '7 days'"
-            )
+            await conn.execute("DELETE FROM ticks WHERE tick_time < NOW() - INTERVAL '7 days'")
             await conn.close()
         except Exception:
             pass
@@ -72,7 +65,7 @@ async def startup():
 async def root():
     return {"status": "Digit Matrix API is running"}
 
-# FRONTEND pushes ticks here
+# Receive ticks from frontend
 @app.post("/api/ticks")
 async def receive_tick(tick: dict):
     try:
@@ -85,11 +78,25 @@ async def receive_tick(tick: dict):
             symbol, price, digit
         )
         await conn.close()
-        return {"status": "received"}
+        return {"status": "received", "market": symbol, "digit": digit}
     except Exception as e:
         return {"error": str(e)}
 
-# Analyze LAST 1000 TICKS (professional standard)
+# Get recent ticks (for signal computation)
+@app.get("/api/ticks/{market}")
+async def get_recent_ticks(market: str, limit: int = 20):
+    conn = await asyncpg.connect(DATABASE_URL)
+    rows = await conn.fetch(
+        "SELECT price, digit, tick_time FROM ticks WHERE market = $1 ORDER BY tick_time DESC LIMIT $2",
+        market, limit
+    )
+    await conn.close()
+    return [
+        {"quote": float(r["price"]), "digit": r["digit"], "time": r["tick_time"].isoformat()}
+        for r in reversed(rows)
+    ]
+
+# 1000-tick deep analysis
 @app.get("/api/analysis/{market}")
 async def get_analysis(market: str, lookback: int = 1000):
     conn = await asyncpg.connect(DATABASE_URL)
@@ -106,15 +113,12 @@ async def get_analysis(market: str, lookback: int = 1000):
     total = len(digits)
     freq = {str(i): round(digits.count(i) / total * 100, 1) for i in range(10)}
     even = sum(1 for d in digits if d % 2 == 0)
-    
-    # Find hottest and coldest digits
     hot_digit = max(freq, key=freq.get)
     cold_digit = min(freq, key=freq.get)
     
-    # Streak detection (how many times same digit repeated consecutively)
     max_streak = 1
     current_streak = 1
-    streak_digit = digits[0] if digits else 0
+    streak_digit = digits[0]
     for i in range(1, len(digits)):
         if digits[i] == digits[i-1]:
             current_streak += 1
@@ -123,9 +127,6 @@ async def get_analysis(market: str, lookback: int = 1000):
                 streak_digit = digits[i]
         else:
             current_streak = 1
-    
-    # Last 20 digits for display
-    last_20 = digits[:20]
     
     return {
         "market": market,
@@ -141,7 +142,19 @@ async def get_analysis(market: str, lookback: int = 1000):
         "hot_pct": freq[hot_digit],
         "cold_pct": freq[cold_digit],
         "max_streak": {"digit": streak_digit, "length": max_streak},
-        "last_20_digits": last_20,
+        "last_20_digits": digits[:20],
+    }
+
+# DEBUG: verify ticks are arriving
+@app.get("/api/debug/count")
+async def tick_count():
+    conn = await asyncpg.connect(DATABASE_URL)
+    row = await conn.fetchrow("SELECT COUNT(*) as c FROM ticks")
+    by_market = await conn.fetch("SELECT market, COUNT(*) as c FROM ticks GROUP BY market")
+    await conn.close()
+    return {
+        "total_ticks": row["c"],
+        "by_market": {r["market"]: r["c"] for r in by_market}
     }
 
 @app.post("/api/trades")
