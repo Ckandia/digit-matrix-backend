@@ -1,5 +1,4 @@
 fastapi
 uvicorn
 websockets
-aiosqlite
 python-dotenv
