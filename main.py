@@ -1,6 +1,6 @@
 import os
 import asyncio
-import asyncpg
+import aiosqlite
 from datetime import datetime
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -15,44 +15,53 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-DATABASE_URL = os.getenv("DATABASE_URL")
+DB_PATH = os.getenv("DB_PATH", "digit_matrix.db")
+
+async def get_db():
+    db = await aiosqlite.connect(DB_PATH)
+    db.row_factory = aiosqlite.Row
+    return db
 
 async def init_db():
-    conn = await asyncpg.connect(DATABASE_URL)
-    await conn.execute("""
+    db = await get_db()
+    await db.execute("""
         CREATE TABLE IF NOT EXISTS ticks (
-            id SERIAL PRIMARY KEY,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
             market TEXT NOT NULL,
-            price NUMERIC,
+            price REAL,
             digit INTEGER,
-            tick_time TIMESTAMP DEFAULT NOW()
-        );
-        CREATE INDEX IF NOT EXISTS idx_ticks_market_time 
-            ON ticks(market, tick_time DESC);
+            tick_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
     """)
-    await conn.execute("""
+    await db.execute("""
+        CREATE INDEX IF NOT EXISTS idx_ticks_market_time 
+            ON ticks(market, tick_time DESC)
+    """)
+    await db.execute("""
         CREATE TABLE IF NOT EXISTS trade_logs (
-            id SERIAL PRIMARY KEY,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
             loginid TEXT,
             market TEXT,
             strategy TEXT,
             contract_type TEXT,
-            stake NUMERIC,
+            stake REAL,
             prediction INTEGER,
-            profit NUMERIC,
+            profit REAL,
             result TEXT,
-            created_at TIMESTAMP DEFAULT NOW()
-        );
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
     """)
-    await conn.close()
+    await db.commit()
+    await db.close()
 
 async def cleanup_old_ticks():
     while True:
         await asyncio.sleep(3600)
         try:
-            conn = await asyncpg.connect(DATABASE_URL)
-            await conn.execute("DELETE FROM ticks WHERE tick_time < NOW() - INTERVAL '7 days'")
-            await conn.close()
+            db = await get_db()
+            await db.execute("DELETE FROM ticks WHERE tick_time < datetime('now', '-7 days')")
+            await db.commit()
+            await db.close()
         except Exception:
             pass
 
@@ -65,46 +74,44 @@ async def startup():
 async def root():
     return {"status": "Digit Matrix API is running"}
 
-# Receive ticks from frontend
 @app.post("/api/ticks")
 async def receive_tick(tick: dict):
     try:
-        conn = await asyncpg.connect(DATABASE_URL)
+        db = await get_db()
         price = float(tick.get("quote", 0))
         digit = int(str(price).replace('.', '')[-1]) if price else 0
         symbol = tick.get("symbol", "unknown")
-        await conn.execute(
-            "INSERT INTO ticks (market, price, digit) VALUES ($1, $2, $3)",
-            symbol, price, digit
+        await db.execute(
+            "INSERT INTO ticks (market, price, digit) VALUES (?, ?, ?)",
+            (symbol, price, digit)
         )
-        await conn.close()
+        await db.commit()
+        await db.close()
         return {"status": "received", "market": symbol, "digit": digit}
     except Exception as e:
         return {"error": str(e)}
 
-# Get recent ticks (for signal computation)
 @app.get("/api/ticks/{market}")
 async def get_recent_ticks(market: str, limit: int = 20):
-    conn = await asyncpg.connect(DATABASE_URL)
-    rows = await conn.fetch(
-        "SELECT price, digit, tick_time FROM ticks WHERE market = $1 ORDER BY tick_time DESC LIMIT $2",
-        market, limit
+    db = await get_db()
+    rows = await db.fetchall(
+        "SELECT price, digit, tick_time FROM ticks WHERE market = ? ORDER BY tick_time DESC LIMIT ?",
+        (market, limit)
     )
-    await conn.close()
+    await db.close()
     return [
-        {"quote": float(r["price"]), "digit": r["digit"], "time": r["tick_time"].isoformat()}
+        {"quote": float(r["price"]), "digit": r["digit"], "time": r["tick_time"]}
         for r in reversed(rows)
     ]
 
-# 1000-tick deep analysis
 @app.get("/api/analysis/{market}")
 async def get_analysis(market: str, lookback: int = 1000):
-    conn = await asyncpg.connect(DATABASE_URL)
-    rows = await conn.fetch(
-        "SELECT digit FROM ticks WHERE market = $1 ORDER BY tick_time DESC LIMIT $2",
-        market, lookback
+    db = await get_db()
+    rows = await db.fetchall(
+        "SELECT digit FROM ticks WHERE market = ? ORDER BY tick_time DESC LIMIT ?",
+        (market, lookback)
     )
-    await conn.close()
+    await db.close()
     
     digits = [r["digit"] for r in rows]
     if not digits:
@@ -145,54 +152,56 @@ async def get_analysis(market: str, lookback: int = 1000):
         "last_20_digits": digits[:20],
     }
 
-# DEBUG: verify ticks are arriving
 @app.get("/api/debug/count")
 async def tick_count():
-    conn = await asyncpg.connect(DATABASE_URL)
-    row = await conn.fetchrow("SELECT COUNT(*) as c FROM ticks")
-    by_market = await conn.fetch("SELECT market, COUNT(*) as c FROM ticks GROUP BY market")
-    await conn.close()
+    db = await get_db()
+    row = await db.fetchone("SELECT COUNT(*) as c FROM ticks")
+    by_market = await db.fetchall("SELECT market, COUNT(*) as c FROM ticks GROUP BY market")
+    await db.close()
     return {
-        "total_ticks": row["c"],
+        "total_ticks": row["c"] if row else 0,
         "by_market": {r["market"]: r["c"] for r in by_market}
     }
 
 @app.post("/api/trades")
 async def log_trade(trade: dict):
-    conn = await asyncpg.connect(DATABASE_URL)
-    await conn.execute(
+    db = await get_db()
+    await db.execute(
         """INSERT INTO trade_logs 
            (loginid, market, strategy, contract_type, stake, prediction, profit, result)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8)""",
-        trade.get("loginid"), trade.get("market"), trade.get("strategy"),
-        trade.get("contract_type"), trade.get("stake"), trade.get("prediction"),
-        trade.get("profit"), trade.get("result")
+           VALUES (?,?,?,?,?,?,?,?)""",
+        (
+            trade.get("loginid"), trade.get("market"), trade.get("strategy"),
+            trade.get("contract_type"), trade.get("stake"), trade.get("prediction"),
+            trade.get("profit"), trade.get("result")
+        )
     )
-    await conn.close()
+    await db.commit()
+    await db.close()
     return {"status": "logged"}
 
 @app.get("/api/trades/{loginid}")
 async def get_trades(loginid: str, limit: int = 50):
-    conn = await asyncpg.connect(DATABASE_URL)
-    rows = await conn.fetch(
-        "SELECT * FROM trade_logs WHERE loginid = $1 ORDER BY created_at DESC LIMIT $2",
-        loginid, limit
+    db = await get_db()
+    rows = await db.fetchall(
+        "SELECT * FROM trade_logs WHERE loginid = ? ORDER BY created_at DESC LIMIT ?",
+        (loginid, limit)
     )
-    await conn.close()
+    await db.close()
     return [dict(r) for r in rows]
 
 @app.get("/api/stats/session/{loginid}")
 async def session_stats(loginid: str):
-    conn = await asyncpg.connect(DATABASE_URL)
-    row = await conn.fetchrow(
+    db = await get_db()
+    row = await db.fetchone(
         """SELECT 
             COUNT(*) as total_trades,
             SUM(CASE WHEN profit > 0 THEN 1 ELSE 0 END) as wins,
             SUM(profit) as net_pnl
-           FROM trade_logs WHERE loginid = $1""",
-        loginid
+           FROM trade_logs WHERE loginid = ?""",
+        (loginid,)
     )
-    await conn.close()
+    await db.close()
     total = row["total_trades"] or 0
     wins = row["wins"] or 0
     return {
