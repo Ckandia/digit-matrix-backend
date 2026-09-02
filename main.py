@@ -2,19 +2,37 @@ import os
 import sqlite3
 import json
 from datetime import datetime
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from starlette.concurrency import run_in_threadpool
 
 app = FastAPI(title="Digit Matrix API")
 
+# Your Vercel frontend domain
+FRONTEND_ORIGIN = "https://digit-matrix-carlos-githaes-projects.vercel.app"
+
+# CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[FRONTEND_ORIGIN, "*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Extra safety: handle OPTIONS preflight for every request
+@app.middleware("http")
+async def add_cors_headers(request: Request, call_next):
+    if request.method == "OPTIONS":
+        response = JSONResponse(content={"ok": True})
+        response.headers["Access-Control-Allow-Origin"] = FRONTEND_ORIGIN
+        response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+        response.headers["Access-Control-Allow-Headers"] = "*"
+        return response
+    response = await call_next(request)
+    response.headers["Access-Control-Allow-Origin"] = FRONTEND_ORIGIN
+    return response
 
 DB_PATH = os.getenv("DB_PATH", "digit_matrix.db")
 
