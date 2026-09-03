@@ -12,19 +12,20 @@ from autotrader import AutoTrader
 
 app = FastAPI(title="Digit Matrix API")
 
-# Your Vercel frontend domain
 FRONTEND_ORIGIN = "https://digit-matrix-carlos-githaes-projects.vercel.app"
 
-# CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[FRONTEND_ORIGIN],  # dropped the "*" — it combined with allow_credentials=True to no real benefit
+    allow_origins=[FRONTEND_ORIGIN],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 DB_PATH = os.getenv("DB_PATH", "digit_matrix.db")
+DB_DIR = os.path.dirname(DB_PATH)
+if DB_DIR and not os.path.exists(DB_DIR):
+    os.makedirs(DB_DIR, exist_ok=True)
 
 def get_db_connection():
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
@@ -93,6 +94,10 @@ async def shutdown():
 @app.get("/")
 async def root():
     return {"status": "Digit Matrix API is running"}
+
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
 
 @app.post("/api/ticks")
 async def receive_tick(tick: dict):
@@ -235,8 +240,6 @@ async def session_stats(loginid: str):
         }
     return await run_in_threadpool(_stats)
 
-# --- Autotrader control, all API-key protected ---
-
 @app.post("/api/autotrader/start", dependencies=[Depends(require_api_key)])
 async def start_autotrader():
     await autotrader.start()
@@ -249,7 +252,6 @@ async def stop_autotrader():
 
 @app.post("/api/autotrader/resume", dependencies=[Depends(require_api_key)])
 async def resume_autotrader():
-    """Call after reviewing why it halted — it will not resume itself."""
     autotrader.resume_after_halt()
     return autotrader.status()
 
