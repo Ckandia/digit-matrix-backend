@@ -2,10 +2,13 @@ import os
 import sqlite3
 import json
 from datetime import datetime
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from starlette.concurrency import run_in_threadpool
+
+from auth import require_api_key
+from autotrader import AutoTrader
 
 app = FastAPI(title="Digit Matrix API")
 
@@ -15,24 +18,11 @@ FRONTEND_ORIGIN = "https://digit-matrix-carlos-githaes-projects.vercel.app"
 # CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[FRONTEND_ORIGIN, "*"],
+    allow_origins=[FRONTEND_ORIGIN],  # dropped the "*" — it combined with allow_credentials=True to no real benefit
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# Extra safety: handle OPTIONS preflight for every request
-@app.middleware("http")
-async def add_cors_headers(request: Request, call_next):
-    if request.method == "OPTIONS":
-        response = JSONResponse(content={"ok": True})
-        response.headers["Access-Control-Allow-Origin"] = FRONTEND_ORIGIN
-        response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
-        response.headers["Access-Control-Allow-Headers"] = "*"
-        return response
-    response = await call_next(request)
-    response.headers["Access-Control-Allow-Origin"] = FRONTEND_ORIGIN
-    return response
 
 DB_PATH = os.getenv("DB_PATH", "digit_matrix.db")
 
@@ -73,9 +63,32 @@ def init_db_sync():
     conn.commit()
     conn.close()
 
+async def _log_trade_to_db(trade: dict):
+    def _insert():
+        conn = get_db_connection()
+        conn.execute(
+            """INSERT INTO trade_logs 
+               (loginid, market, strategy, contract_type, stake, prediction, profit, result)
+               VALUES (?,?,?,?,?,?,?,?)""",
+            (
+                trade.get("loginid"), trade.get("market"), trade.get("strategy"),
+                trade.get("contract_type"), trade.get("stake"), trade.get("prediction"),
+                trade.get("profit"), trade.get("result")
+            )
+        )
+        conn.commit()
+        conn.close()
+    await run_in_threadpool(_insert)
+
+autotrader = AutoTrader(log_trade_fn=_log_trade_to_db)
+
 @app.on_event("startup")
 async def startup():
     await run_in_threadpool(init_db_sync)
+
+@app.on_event("shutdown")
+async def shutdown():
+    await autotrader.stop()
 
 @app.get("/")
 async def root():
@@ -181,22 +194,8 @@ async def tick_count():
 
 @app.post("/api/trades")
 async def log_trade(trade: dict):
-    def _insert():
-        conn = get_db_connection()
-        conn.execute(
-            """INSERT INTO trade_logs 
-               (loginid, market, strategy, contract_type, stake, prediction, profit, result)
-               VALUES (?,?,?,?,?,?,?,?)""",
-            (
-                trade.get("loginid"), trade.get("market"), trade.get("strategy"),
-                trade.get("contract_type"), trade.get("stake"), trade.get("prediction"),
-                trade.get("profit"), trade.get("result")
-            )
-        )
-        conn.commit()
-        conn.close()
-        return {"status": "logged"}
-    return await run_in_threadpool(_insert)
+    await _log_trade_to_db(trade)
+    return {"status": "logged"}
 
 @app.get("/api/trades/{loginid}")
 async def get_trades(loginid: str, limit: int = 50):
@@ -235,3 +234,25 @@ async def session_stats(loginid: str):
             "net_pnl": float(row["net_pnl"] or 0),
         }
     return await run_in_threadpool(_stats)
+
+# --- Autotrader control, all API-key protected ---
+
+@app.post("/api/autotrader/start", dependencies=[Depends(require_api_key)])
+async def start_autotrader():
+    await autotrader.start()
+    return autotrader.status()
+
+@app.post("/api/autotrader/stop", dependencies=[Depends(require_api_key)])
+async def stop_autotrader():
+    await autotrader.stop()
+    return autotrader.status()
+
+@app.post("/api/autotrader/resume", dependencies=[Depends(require_api_key)])
+async def resume_autotrader():
+    """Call after reviewing why it halted — it will not resume itself."""
+    autotrader.resume_after_halt()
+    return autotrader.status()
+
+@app.get("/api/autotrader/status", dependencies=[Depends(require_api_key)])
+async def autotrader_status():
+    return autotrader.status()
