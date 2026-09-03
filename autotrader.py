@@ -6,27 +6,19 @@ import websockets
 
 from safety import SafetyGuard, SafetyConfig
 
-DERIV_WS_URL = "wss://ws.derivws.com/websockets/v3?app_id=1089"  # swap 1089 for your own app_id
-DERIV_API_TOKEN = os.getenv("DERIV_API_TOKEN")  # a Deriv API token, scoped to trade — use a DEMO token first
+DERIV_WS_URL = "wss://ws.derivws.com/websockets/v3?app_id=1089"
+DERIV_API_TOKEN = os.getenv("DERIV_API_TOKEN")
 
-# The watchlist: what to trade, not how to "predict" it. Each entry runs on its
-# own schedule. Keep this rule-based and boring on purpose — see signal.ts for
-# why treating digit contracts as predictable is a mistake to avoid repeating here.
 WATCHLIST = [
     {"market": "R_10", "contract_type": "DIGITEVEN", "stake": 0.5, "duration": 1},
     {"market": "R_25", "contract_type": "DIGITODD", "stake": 0.5, "duration": 1},
 ]
 
-TRADE_INTERVAL_SECONDS = 30  # how often each watchlist entry gets a chance to fire
+TRADE_INTERVAL_SECONDS = 30
 
 
 class AutoTrader:
     def __init__(self, log_trade_fn):
-        """
-        log_trade_fn: an async callable(trade: dict) -> None, used to persist
-        each result the same way /api/trades already does, so this shows up in
-        the same trade_logs table and the existing session-stats endpoint.
-        """
         self.guard = SafetyGuard(SafetyConfig())
         self.log_trade_fn = log_trade_fn
         self._task: asyncio.Task | None = None
@@ -77,14 +69,13 @@ class AutoTrader:
 
                     ok, reason = self.guard.can_trade(entry["market"])
                     if not ok:
-                        # Halted or capped — skip silently, status endpoint shows why
                         continue
 
                     try:
                         profit = await self._place_and_wait(ws, entry)
                         self.guard.record_result(entry["market"], profit)
                         await self.log_trade_fn({
-                            "loginid": None,  # fill in from your account context if trading multiple accounts
+                            "loginid": None,
                             "market": entry["market"],
                             "strategy": "autotrader",
                             "contract_type": entry["contract_type"],
@@ -94,8 +85,6 @@ class AutoTrader:
                             "result": "win" if profit > 0 else "loss",
                         })
                     except Exception as e:
-                        # A single failed trade shouldn't kill the whole worker —
-                        # log and keep going, but don't silently retry-spam Deriv.
                         print(f"[autotrader] trade error on {entry['market']}: {e}")
 
                     last_fired[entry["market"]] = now
@@ -107,12 +96,6 @@ class AutoTrader:
                 await asyncio.sleep(1)
 
     async def _place_and_wait(self, ws, entry: dict) -> float:
-        """
-        Sends a proposal, buys it, then waits for the contract to settle and
-        returns realized profit. This is the minimal Deriv contract-buy flow —
-        test it thoroughly against a DEMO account before ever pointing
-        DERIV_API_TOKEN at a real one.
-        """
         await ws.send(json.dumps({
             "proposal": 1,
             "amount": entry["stake"],
