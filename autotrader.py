@@ -1,13 +1,15 @@
 import asyncio
 import json
-import os
 import time
 import websockets
+import httpx
 
 from safety import SafetyGuard, SafetyConfig
 
-DERIV_WS_URL = "wss://ws.derivws.com/websockets/v3?app_id=1089"
-DERIV_API_TOKEN = os.getenv("DERIV_API_TOKEN")
+DERIV_REST_BASE_URL = {
+    "production": "https://api.derivws.com/trading/v1/",
+    "staging": "https://staging-api.derivws.com/trading/v1/",
+}
 
 WATCHLIST = [
     {"market": "R_10", "contract_type": "DIGITEVEN", "stake": 0.5, "duration": 1},
@@ -25,18 +27,33 @@ class AutoTrader:
         self._ws = None
         self._running = False
 
+        self.access_token: str | None = None
+        self.loginid: str | None = None
+        self.environment: str = "production"
+
     @property
     def is_running(self) -> bool:
         return self._running
 
     def status(self) -> dict:
-        return {"running": self._running, **self.guard.status()}
+        return {
+            "running": self._running,
+            "loginid": self.loginid,
+            "environment": self.environment,
+            **self.guard.status(),
+        }
 
-    async def start(self):
+    async def start(self, access_token: str, loginid: str, environment: str = "production"):
         if self._running:
             return
-        if not DERIV_API_TOKEN:
-            raise RuntimeError("DERIV_API_TOKEN not set")
+        if not access_token:
+            raise RuntimeError("access_token is required")
+        if not loginid:
+            raise RuntimeError("loginid is required")
+
+        self.access_token = access_token
+        self.loginid = loginid
+        self.environment = environment
         self._running = True
         self._task = asyncio.create_task(self._run_loop())
 
@@ -44,56 +61,91 @@ class AutoTrader:
         self._running = False
         if self._task:
             self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
         if self._ws:
             await self._ws.close()
+            self._ws = None
+
+        self.access_token = None
+        self.loginid = None
 
     def resume_after_halt(self):
         self.guard.reset_halt()
 
+    async def _get_otp_url(self) -> str:
+        base_url = DERIV_REST_BASE_URL.get(
+            self.environment, DERIV_REST_BASE_URL["production"]
+        )
+        endpoint = f"{base_url}options/accounts/{self.loginid}/otp"
+
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                endpoint,
+                headers={"Authorization": f"Bearer {self.access_token}"},
+                timeout=15.0,
+            )
+            response.raise_for_status()
+            data = response.json()
+
+        websocket_url = data.get("data", {}).get("url")
+        if not websocket_url:
+            raise RuntimeError("No WebSocket URL in OTP response")
+        return websocket_url
+
     async def _run_loop(self):
-        async with websockets.connect(DERIV_WS_URL) as ws:
-            self._ws = ws
-            await ws.send(json.dumps({"authorize": DERIV_API_TOKEN}))
-            auth_resp = json.loads(await ws.recv())
-            if "error" in auth_resp:
-                self._running = False
-                raise RuntimeError(f"Deriv auth failed: {auth_resp['error']}")
+        try:
+            ws_url = await self._get_otp_url()
+        except Exception as e:
+            self._running = False
+            raise RuntimeError(f"Failed to get OTP URL: {e}")
 
-            last_fired = {entry["market"]: 0.0 for entry in WATCHLIST}
+        try:
+            async with websockets.connect(ws_url) as ws:
+                self._ws = ws
+                last_fired = {entry["market"]: 0.0 for entry in WATCHLIST}
 
-            while self._running:
-                now = time.time()
-                for entry in WATCHLIST:
-                    if now - last_fired[entry["market"]] < TRADE_INTERVAL_SECONDS:
-                        continue
+                while self._running:
+                    now = time.time()
+                    for entry in WATCHLIST:
+                        if now - last_fired[entry["market"]] < TRADE_INTERVAL_SECONDS:
+                            continue
 
-                    ok, reason = self.guard.can_trade(entry["market"])
-                    if not ok:
-                        continue
+                        ok, reason = self.guard.can_trade(entry["market"])
+                        if not ok:
+                            continue
 
-                    try:
-                        profit = await self._place_and_wait(ws, entry)
-                        self.guard.record_result(entry["market"], profit)
-                        await self.log_trade_fn({
-                            "loginid": None,
-                            "market": entry["market"],
-                            "strategy": "autotrader",
-                            "contract_type": entry["contract_type"],
-                            "stake": entry["stake"],
-                            "prediction": None,
-                            "profit": profit,
-                            "result": "win" if profit > 0 else "loss",
-                        })
-                    except Exception as e:
-                        print(f"[autotrader] trade error on {entry['market']}: {e}")
+                        try:
+                            profit = await self._place_and_wait(ws, entry)
+                            self.guard.record_result(entry["market"], profit)
+                            await self.log_trade_fn({
+                                "loginid": self.loginid,
+                                "market": entry["market"],
+                                "strategy": "autotrader",
+                                "contract_type": entry["contract_type"],
+                                "stake": entry["stake"],
+                                "prediction": None,
+                                "profit": profit,
+                                "result": "win" if profit > 0 else "loss",
+                            })
+                        except Exception as e:
+                            print(f"[autotrader] trade error on {entry['market']}: {e}")
 
-                    last_fired[entry["market"]] = now
+                        last_fired[entry["market"]] = now
 
-                if self.guard.status()["halted"]:
-                    self._running = False
-                    break
+                    if self.guard.status()["halted"]:
+                        self._running = False
+                        break
 
-                await asyncio.sleep(1)
+                    await asyncio.sleep(1)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            print(f"[autotrader] connection lost: {e}")
+            self._running = False
+            raise
 
     async def _place_and_wait(self, ws, entry: dict) -> float:
         await ws.send(json.dumps({
