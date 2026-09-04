@@ -2,7 +2,7 @@ import os
 import sqlite3
 import json
 from datetime import datetime
-from fastapi import FastAPI, Request, Depends
+from fastapi import FastAPI, Request, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from starlette.concurrency import run_in_threadpool
@@ -241,8 +241,18 @@ async def session_stats(loginid: str):
     return await run_in_threadpool(_stats)
 
 @app.post("/api/autotrader/start", dependencies=[Depends(require_api_key)])
-async def start_autotrader():
-    await autotrader.start()
+async def start_autotrader(body: dict):
+    access_token = body.get("access_token")
+    loginid = body.get("loginid")
+    environment = body.get("environment", "production")
+
+    if not access_token or not loginid:
+        raise HTTPException(
+            status_code=400,
+            detail="access_token and loginid are required"
+        )
+
+    await autotrader.start(access_token, loginid, environment)
     return autotrader.status()
 
 @app.post("/api/autotrader/stop", dependencies=[Depends(require_api_key)])
